@@ -1,0 +1,153 @@
+function main() {
+  const CONFIG = {
+    SPREADSHEET_URL: 'yoursheet',
+    SHEET_NAME: 'Master Sheet',
+    CID_COLUMN: 3, // Column C for Customer IDs
+    LABEL_COLUMN: 9, // Column I for Labels
+    EMAIL_REPORT: false,
+    REPORT_EMAIL_ADDRESS: 'your-email@example.com',
+  };
+
+  try {
+    const spreadsheet = SpreadsheetApp.openByUrl(CONFIG.SPREADSHEET_URL);
+    const sheet = spreadsheet.getSheetByName(CONFIG.SHEET_NAME);
+    if (!sheet) throw new Error(`Sheet "${CONFIG.SHEET_NAME}" not found.`);
+    const data = sheet.getDataRange().getValues();
+
+    const logMessages = [];
+    logMessages.push(`Script Execution Report - ${new Date().toISOString()}`);
+
+    const pairs = processAllDataRows(data, CONFIG, logMessages);
+    if (pairs.length === 0) {
+      logMessages.push('❌ No valid CID-label pairs found.');
+      Logger.log(logMessages.join('\n'));
+      return;
+    }
+
+    pairs.forEach(pair => processLabelForAccount(pair, logMessages));
+
+    if (CONFIG.EMAIL_REPORT) {
+      sendEmailReport(CONFIG.REPORT_EMAIL_ADDRESS, logMessages.join('\n'));
+    }
+
+    Logger.log(logMessages.join('\n'));
+  } catch (error) {
+    Logger.log(`Critical error: ${error.message}`);
+  }
+}
+
+function processAllDataRows(data, config, logMessages) {
+  const pairs = [];
+  for (let i = 1; i < data.length; i++) {
+    const cidField = data[i][config.CID_COLUMN - 1];
+    const labelName = data[i][config.LABEL_COLUMN - 1]?.toString().trim();
+
+    Logger.log(`Processing Row ${i + 1}: CID = "${cidField}", Label = "${labelName}"`);
+
+    if (!labelName) {
+      logMessages.push(`Row ${i + 1}: Missing label. Skipping.`);
+      continue;
+    }
+
+    if (!cidField || cidField.toString().trim() === 'NA' || cidField.toString().trim() === '-') {
+      logMessages.push(`Row ${i + 1}: Missing or invalid CID. Skipping.`);
+      continue;
+    }
+
+    const formattedCid = formatCID(cidField.trim());
+    if (formattedCid) {
+      pairs.push({ cid: formattedCid, label: labelName });
+      logMessages.push(`✓ Found CID "${formattedCid}" with label "${labelName}"`);
+    } else {
+      logMessages.push(`Row ${i + 1}: Invalid CID format "${cidField}". Skipping.`);
+    }
+  }
+  return pairs;
+}
+
+function formatCID(cid) {
+  const digits = cid.replace(/\D/g, '');
+  return digits.length === 10 ? digits.replace(/(\d{3})(\d{3})(\d{4})/, '$1-$2-$3') : null;
+}
+
+function processLabelForAccount(pair, logMessages) {
+  try {
+    // Step 1: Verify or Create Label at MCC Level
+    const labelCreated = verifyOrCreateLabelAtMCC(pair.label, logMessages);
+    if (!labelCreated) {
+      logMessages.push(`❌ Failed to verify/create label "${pair.label}".`);
+      return;
+    }
+
+    // Step 2: Find Account
+    const accountIterator = MccApp.accounts().withIds([pair.cid]).get();
+    if (!accountIterator.hasNext()) {
+      logMessages.push(`❌ Account ${pair.cid} not found.`);
+      return;
+    }
+
+    const account = accountIterator.next();
+    logMessages.push(`✓ Found account: ${account.getCustomerId()} (${account.getName()})`);
+
+    // Step 3: Select Account
+    MccApp.select(account);
+    logMessages.push(`✓ Selected account ${account.getCustomerId()}`);
+
+    // Step 4: Assign Label
+    assignLabelToAccount(pair.label, account, logMessages);
+  } catch (error) {
+    logMessages.push(`❌ Error processing label "${pair.label}" for account ${pair.cid}: ${error.message}`);
+  }
+}
+
+function assignLabelToAccount(labelName, account, logMessages) {
+  try {
+    const escapedName = labelName.replace(/'/g, "\\'");
+    const labelIterator = AdsApp.labels().withCondition(`Name = '${escapedName}'`).get();
+
+    if (labelIterator.hasNext()) {
+      logMessages.push(`✓ Label "${labelName}" verified.`);
+      account.applyLabel(labelName);
+      logMessages.push(`✓ Label "${labelName}" successfully applied to account ${account.getCustomerId()}`);
+    } else {
+      logMessages.push(`❌ Label "${labelName}" not found.`);
+    }
+  } catch (error) {
+    logMessages.push(`❌ Error assigning label "${labelName}" to account ${account.getCustomerId()}: ${error.message}`);
+  }
+}
+
+function verifyOrCreateLabelAtMCC(labelName, logMessages) {
+  try {
+    const escapedName = labelName.replace(/'/g, "\\'");
+    let labelIterator = AdsApp.labels().withCondition(`Name = '${escapedName}'`).get();
+
+    if (labelIterator.hasNext()) {
+      logMessages.push(`✓ Label "${labelName}" verified.`);
+      return true;
+    }
+
+    AdsApp.createLabel(labelName);
+    Utilities.sleep(1000); // Wait for propagation
+
+    labelIterator = AdsApp.labels().withCondition(`Name = '${escapedName}'`).get();
+    if (labelIterator.hasNext()) {
+      logMessages.push(`✓ Label "${labelName}" created and verified.`);
+      return true;
+    }
+
+    logMessages.push(`❌ Label "${labelName}" verification failed.`);
+    return false;
+  } catch (error) {
+    logMessages.push(`❌ Error verifying/creating label "${labelName}": ${error.message}`);
+    return false;
+  }
+}
+
+function sendEmailReport(emailAddress, content) {
+  MailApp.sendEmail({
+    to: emailAddress,
+    subject: 'Google Ads MCC Label Assignment Report',
+    body: content
+  });
+} 
